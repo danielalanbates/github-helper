@@ -12,8 +12,8 @@ import os
 from datetime import datetime
 from collections import deque
 
-BOT_TOKEN = "8415315576:AAHwsKk-R6zED0KUh6EQdef3xaCOpbFRFS4"
-CHAT_ID = "8450027682"
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 API_URL = f"{BASE_URL}/sendMessage"
 
