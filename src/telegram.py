@@ -1,4 +1,4 @@
-"""Telegram two-way communication for the Do-Good GitHub Agent.
+"""Telegram two-way communication for dogood.
 
 Outbound: notify Daniel about GitHub events.
 Inbound:  pipe Daniel's messages to Claude Code for intelligent processing.
@@ -11,13 +11,17 @@ import re
 import os
 from datetime import datetime
 from collections import deque
+from pathlib import Path
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 API_URL = f"{BASE_URL}/sendMessage"
 
-PROJECT_DIR = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/github-helper"
+PROJECT_DIR = "/Volumes/X10 Pro danielalanbatesatgmail.com /AIcode/dogood"
+
+TELEGRAM_INBOX = "/tmp/telegram-inbox.jsonl"
+TELEGRAM_OUTBOX = "/tmp/telegram-outbox.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +124,15 @@ class TelegramDaemon:
 
     def run(self, poll_interval: int = 5):
         """Run the Telegram daemon — long-polls for messages."""
-        print("Telegram daemon started", flush=True)
-        print(f"  Messages are piped to Claude Code (claude -p)", flush=True)
-        print(f"  Working dir: {PROJECT_DIR}", flush=True)
+        print("Telegram daemon started (bridge mode)", flush=True)
+        print(f"  Inbox:  {TELEGRAM_INBOX}", flush=True)
+        print(f"  Outbox: {TELEGRAM_OUTBOX}", flush=True)
         print(flush=True)
 
         while True:
             try:
-                updates = get_updates(offset=self.offset, timeout=30)
+                # Poll for incoming Telegram messages
+                updates = get_updates(offset=self.offset, timeout=5)
                 for update in updates:
                     self.offset = update["update_id"] + 1
                     msg = update.get("message", {})
@@ -143,6 +148,9 @@ class TelegramDaemon:
 
                     reply_to = msg.get("reply_to_message", {})
                     self._handle_message(text, reply_to)
+
+                # Poll outbox for responses from Claude Code session
+                self._poll_outbox()
 
             except KeyboardInterrupt:
                 print("\nTelegram daemon stopped.", flush=True)
@@ -182,93 +190,108 @@ class TelegramDaemon:
         return "\n\n".join(parts)
 
     def _handle_message(self, text: str, reply_to: dict):
-        """Pipe Daniel's message to Claude Code and relay the response."""
+        """Respond to Daniel via claude -p, with inbox fallback for active CLI sessions."""
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] Daniel: {text[:120]}", flush=True)
+        print(f"[{ts}] Daniel: {text[:200]}", flush=True)
 
-        # Record Daniel's message in conversation history
+        reply_context = ""
+        if reply_to:
+            reply_context = reply_to.get("text", "")[:500]
+            print(f"[{ts}]   (replying to: {reply_context[:100]})", flush=True)
+
+        # Always write to inbox so CLI session can see it too
+        msg = {
+            "timestamp": datetime.now().isoformat(),
+            "text": text,
+            "reply_to": reply_context,
+        }
+        try:
+            inbox = Path(TELEGRAM_INBOX)
+            with inbox.open("a") as f:
+                f.write(json.dumps(msg) + "\n")
+        except Exception:
+            pass
+
+        # Record in conversation history
         self.conversation.append({"role": "user", "text": text[:500]})
 
-        # Build context (includes conversation history)
+        # Build context
         context = self._build_context(text, reply_to)
 
-        # Build the prompt for Claude
         system_prompt = (
             "You are Claude, Daniel Bates' AI assistant. Daniel is messaging you via Telegram.\n"
-            "You manage the Do-Good GitHub Helper — an autonomous agent that finds and fixes bugs "
-            "on social-good open-source projects.\n\n"
-            "CRITICAL: You are in a MULTI-TURN conversation. The CONVERSATION HISTORY in your "
-            "context shows previous messages. When Daniel says things like 'yes', 'do it', "
-            "'all of them', etc., refer to the conversation history to understand what he means.\n\n"
+            "You manage dogood — an autonomous agent factory that finds and fixes "
+            "bugs on open-source projects.\n\n"
             "RULES:\n"
-            "- Keep responses concise and Telegram-friendly (under 3000 chars)\n"
-            "- If Daniel asks to reply to a GitHub PR/issue, use `gh pr comment` or `gh issue comment`\n"
-            "- If Daniel asks to update code, edit the files directly\n"
+            "- Keep responses concise and Telegram-friendly (under 2000 chars)\n"
             "- If Daniel asks about status, query the SQLite DB at data/github_helper.db\n"
-            "- If Daniel asks to restart a service, use the appropriate CLI command\n"
+            "- If Daniel asks to reply to a GitHub PR/issue, use `gh pr comment` or `gh issue comment`\n"
             "- You have full access to the project at: " + PROJECT_DIR + "\n"
-            "- When posting GitHub comments, delay 60 seconds first to seem natural\n"
-            "- Be direct and helpful. No fluff. Short answers for short questions.\n"
+            "- Be direct. No fluff.\n"
         )
-
         if context:
             system_prompt += f"\n{context}\n"
 
         full_prompt = f"Daniel: {text}"
 
-        # Run claude -p with the project directory
         try:
             cmd = [
                 "claude", "-p", full_prompt,
                 "--system-prompt", system_prompt,
                 "--model", "haiku",
-                "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep",
+                "--allowedTools", "Bash,Read,Glob,Grep",
                 "--add-dir", PROJECT_DIR,
                 "--no-session-persistence",
             ]
 
             print(f"[{ts}] -> claude -p (haiku)...", flush=True)
+            env = {k: v for k, v in os.environ.items()
+                   if "CLAUDE" not in k.upper()}
+            env["PATH"] = os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            env["HOME"] = os.environ.get("HOME", "/Users/daniel")
+
             result = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=180,
-                cwd=PROJECT_DIR,
-                env={
-                    **{k: v for k, v in os.environ.items()
-                       if k not in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID")},
-                    "CLAUDE_CODE_DISABLE_NONESSENTIAL": "1",
-                },
+                cmd, capture_output=True, text=True, timeout=120,
+                cwd=PROJECT_DIR, env=env,
             )
 
             response = result.stdout.strip()
-            stderr = result.stderr.strip()
-
-            if result.returncode != 0 and not response:
+            if result.returncode != 0 or not response:
+                stderr = result.stderr.strip()
                 print(f"[{ts}] Claude error (rc={result.returncode}): {stderr[:200]}", flush=True)
-                notify_plain(f"Error: {stderr[:300]}")
+                # Don't send error to user — just log it
                 return
 
-            if not response:
-                response = "(empty response)"
-
             print(f"[{ts}] <- {response[:120]}", flush=True)
-
-            # Record Claude's response in conversation history
             self.conversation.append({"role": "assistant", "text": response[:500]})
 
-            # Send response back via Telegram (chunked if needed)
             for i in range(0, len(response), 4000):
-                chunk = response[i:i + 4000]
-                notify_plain(chunk)
+                notify_plain(response[i:i + 4000])
 
         except subprocess.TimeoutExpired:
-            print(f"[{ts}] Claude timed out (180s)", flush=True)
-            notify_plain("Timed out (180s). Try a simpler request.")
-        except FileNotFoundError:
-            print(f"[{ts}] 'claude' CLI not found!", flush=True)
-            notify_plain("Error: claude CLI not found.")
+            print(f"[{ts}] Claude timed out (120s)", flush=True)
         except Exception as e:
             print(f"[{ts}] Error: {e}", flush=True)
-            notify_plain(f"Error: {e}")
+
+    def _poll_outbox(self):
+        """Check outbox for responses from Claude Code session and send them."""
+        outbox = Path(TELEGRAM_OUTBOX)
+        if not outbox.exists() or outbox.stat().st_size == 0:
+            return
+        try:
+            lines = outbox.read_text().strip().split("\n")
+            outbox.write_text("")  # Clear after reading
+            for line in lines:
+                if not line.strip():
+                    continue
+                msg = json.loads(line)
+                text = msg.get("text", "")
+                if text:
+                    for i in range(0, len(text), 4000):
+                        notify_plain(text[i:i + 4000])
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent response: {text[:80]}", flush=True)
+        except Exception as e:
+            print(f"Outbox error: {e}", flush=True)
 
     def record_notification(self, event_type: str, repo: str, url: str, summary: str):
         """Record an outbound notification for context tracking."""

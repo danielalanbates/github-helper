@@ -223,6 +223,24 @@ MIGRATIONS = [
             ALTER TABLE contributions ADD COLUMN pr_close_reason TEXT;
         """,
     },
+    # Migration 15: Feedback revision tracking columns
+    {
+        "id": 15,
+        "description": "Add feedback columns to contributions for revision tracking",
+        "sql": """
+            ALTER TABLE contributions ADD COLUMN feedback_text TEXT;
+            ALTER TABLE contributions ADD COLUMN feedback_pr_url TEXT;
+            ALTER TABLE contributions ADD COLUMN feedback_reviewer TEXT;
+        """,
+    },
+    # Migration 16: Mandatory model override for feedback items
+    {
+        "id": 16,
+        "description": "Add mandatory_model to contributions for Daniel tier overrides",
+        "sql": """
+            ALTER TABLE contributions ADD COLUMN mandatory_model TEXT;
+        """,
+    },
 ]
 
 

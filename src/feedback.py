@@ -16,6 +16,7 @@ from src.concurrency import ConnectionPool, LogWriter
 from src.db import (
     add_to_blacklist, remove_from_blacklist, is_blacklisted,
     add_learned_pattern, add_sponsor, get_opus_usage_for_repo,
+    get_contribution_by_pr_url, update_feedback_status,
 )
 from src.utils import now_iso
 from src.telegram import notify_github_attention
@@ -34,8 +35,8 @@ COMPASSION_REENGAGEMENT = (
 
 # Sentiment keywords for quick classification before AI analysis
 HOSTILE_KEYWORDS = {
-    "spam", "bot", "garbage", "terrible", "awful", "worst", "useless",
-    "stop", "go away", "not welcome", "ban", "block", "unwanted",
+    "spam", "this is spam", "garbage", "terrible", "awful", "worst", "useless",
+    "stop submitting", "go away", "not welcome", "ban this", "unwanted",
     "waste of time", "low quality", "low-quality", "junk",
 }
 ANTI_AI_KEYWORDS = {
@@ -67,10 +68,169 @@ PAYMENT_KEYWORDS = {
     "wire transfer", "crypto", "wallet address",
 }
 JOB_KEYWORDS = {
-    "hire", "hiring", "job", "position", "work for us", "join us",
-    "contract", "freelance", "consulting", "interested in working",
-    "opportunity", "role", "full-time", "part-time",
+    "hire you", "hiring you", "we're hiring", "job offer", "work for us",
+    "join our team", "freelance work", "consulting gig",
+    "interested in working with you", "full-time position", "part-time position",
 }
+
+
+def _detect_language(text: str) -> str:
+    """Detect language from text using character frequency analysis.
+
+    Returns ISO 639-1 code: 'en', 'zh', 'ja', 'ko', 'ru', 'ar', 'es', 'pt', 'de', 'fr', etc.
+    """
+    if not text or len(text) < 10:
+        return "en"
+
+    # Count character ranges
+    cjk = 0      # Chinese/Japanese shared
+    hiragana = 0  # Japanese-specific
+    katakana = 0  # Japanese-specific
+    hangul = 0    # Korean
+    cyrillic = 0  # Russian/Ukrainian/etc
+    arabic = 0    # Arabic/Persian
+    latin = 0
+    total = 0
+
+    for ch in text:
+        cp = ord(ch)
+        if cp < 128:
+            if ch.isalpha():
+                latin += 1
+            total += 1
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            cjk += 1; total += 1
+        elif 0x3040 <= cp <= 0x309F:
+            hiragana += 1; total += 1
+        elif 0x30A0 <= cp <= 0x30FF:
+            katakana += 1; total += 1
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+            hangul += 1; total += 1
+        elif 0x0400 <= cp <= 0x04FF:
+            cyrillic += 1; total += 1
+        elif 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
+            arabic += 1; total += 1
+        else:
+            total += 1
+
+    if total == 0:
+        return "en"
+
+    # Japanese: has hiragana/katakana
+    if (hiragana + katakana) > total * 0.05:
+        return "ja"
+    # Korean
+    if hangul > total * 0.1:
+        return "ko"
+    # Chinese (CJK without Japanese markers)
+    if cjk > total * 0.1:
+        return "zh"
+    # Russian/Cyrillic
+    if cyrillic > total * 0.15:
+        return "ru"
+    # Arabic
+    if arabic > total * 0.15:
+        return "ar"
+
+    # For Latin-script languages, check for common words
+    text_lower = text.lower()
+    # Spanish
+    if any(w in text_lower for w in [" está ", " también ", " pero ", " porque ", " gracias "]):
+        return "es"
+    # Portuguese
+    if any(w in text_lower for w in [" também ", " então ", " obrigado ", " não ", " muito "]):
+        return "pt"
+    # German
+    if any(w in text_lower for w in [" und ", " nicht ", " aber ", " danke ", " bitte "]):
+        return "de"
+    # French
+    if any(w in text_lower for w in [" merci ", " mais ", " aussi ", " avec ", " très "]):
+        return "fr"
+
+    return "en"
+
+
+# Pre-translated canned responses for top languages
+_TRANSLATIONS = {
+    "thank_review": {
+        "en": "Thank you for the review! Glad it helps. 🙏",
+        "zh": "感谢您的审查！很高兴能有所帮助。🙏",
+        "ja": "レビューありがとうございます！お役に立てて嬉しいです。🙏",
+        "ko": "리뷰해 주셔서 감사합니다! 도움이 되어 기쁩니다. 🙏",
+        "ru": "Спасибо за ревью! Рад, что помогло. 🙏",
+        "es": "¡Gracias por la revisión! Me alegra que ayude. 🙏",
+        "pt": "Obrigado pela revisão! Fico feliz em ajudar. 🙏",
+        "de": "Danke für das Review! Freut mich, dass es hilft. 🙏",
+        "fr": "Merci pour la revue ! Content que ça aide. 🙏",
+        "ar": "شكراً على المراجعة! سعيد أنها مفيدة. 🙏",
+    },
+    "polite_exit": {
+        "en": POLITE_EXIT,
+        "zh": "感谢您的反馈！感谢您抽出时间进行审查。我将撤回此 PR。祝项目一切顺利！",
+        "ja": "フィードバックありがとうございます！レビューにお時間をいただき感謝します。このPRを取り下げます。プロジェクトの成功をお祈りしています！",
+        "ko": "피드백 감사합니다! 리뷰에 시간을 내주셔서 감사합니다. 이 PR을 철회하겠습니다. 프로젝트의 성공을 기원합니다!",
+        "ru": "Спасибо за обратную связь! Благодарю за время на ревью. Я отзову этот PR. Желаю проекту успехов!",
+        "es": "¡Gracias por los comentarios! Agradezco que se haya tomado el tiempo de revisar. Retiraré este PR. ¡Les deseo mucho éxito!",
+        "pt": "Obrigado pelo feedback! Agradeço o tempo dedicado à revisão. Vou retirar este PR. Desejo sucesso ao projeto!",
+        "de": "Danke für das Feedback! Ich schätze die Zeit für das Review. Ich ziehe diesen PR zurück. Viel Erfolg weiterhin!",
+        "fr": "Merci pour le retour ! J'apprécie le temps consacré à la revue. Je retire cette PR. Je souhaite beaucoup de succès au projet !",
+        "ar": "شكراً على الملاحظات! أقدر وقتكم في المراجعة. سأسحب هذا الطلب. أتمنى النجاح المستمر للمشروع!",
+    },
+    "sponsor_thanks": {
+        "en": "Thank you so much for the kind words and support! 🙏",
+        "zh": "非常感谢您的支持和鼓励！🙏",
+        "ja": "温かいお言葉とご支援、本当にありがとうございます！🙏",
+        "ko": "따뜻한 말씀과 응원에 진심으로 감사드립니다! 🙏",
+        "ru": "Большое спасибо за добрые слова и поддержку! 🙏",
+        "es": "¡Muchas gracias por las amables palabras y el apoyo! 🙏",
+        "pt": "Muito obrigado pelas palavras gentis e pelo apoio! 🙏",
+        "de": "Vielen Dank für die freundlichen Worte und die Unterstützung! 🙏",
+        "fr": "Merci beaucoup pour les mots gentils et le soutien ! 🙏",
+        "ar": "شكراً جزيلاً على الكلمات الطيبة والدعم! 🙏",
+    },
+    "contact_reply": {
+        "en": "Thanks for reaching out! The best way to contact me is daniel@batesai.org.",
+        "zh": "感谢您的联系！联系我的最佳方式是 daniel@batesai.org。",
+        "ja": "ご連絡ありがとうございます！最適な連絡先は daniel@batesai.org です。",
+        "ko": "연락해 주셔서 감사합니다! 저에게 연락하는 가장 좋은 방법은 daniel@batesai.org 입니다.",
+        "ru": "Спасибо за обращение! Лучший способ связаться со мной — daniel@batesai.org.",
+        "es": "¡Gracias por comunicarse! La mejor forma de contactarme es daniel@batesai.org.",
+        "pt": "Obrigado pelo contato! A melhor forma de me contactar é daniel@batesai.org.",
+        "de": "Danke für die Kontaktaufnahme! Am besten erreichen Sie mich unter daniel@batesai.org.",
+        "fr": "Merci de nous contacter ! Le meilleur moyen de me joindre est daniel@batesai.org.",
+        "ar": "شكراً للتواصل! أفضل طريقة للاتصال بي هي daniel@batesai.org.",
+    },
+    "payment_reply": {
+        "en": "Thanks for asking! For payment details, please email daniel@batesai.org and I'll get back to you promptly.",
+        "zh": "感谢您的询问！有关付款详情，请发邮件至 daniel@batesai.org，我会尽快回复。",
+        "ja": "お問い合わせありがとうございます！お支払いの詳細については daniel@batesai.org までメールをお送りください。速やかにお返事いたします。",
+        "ko": "문의해 주셔서 감사합니다! 결제 관련 내용은 daniel@batesai.org 로 이메일 주시면 빠르게 답변드리겠습니다.",
+        "ru": "Спасибо за вопрос! По вопросам оплаты, пожалуйста, напишите на daniel@batesai.org — отвечу оперативно.",
+        "es": "¡Gracias por preguntar! Para detalles de pago, envíe un correo a daniel@batesai.org y le responderé pronto.",
+        "pt": "Obrigado por perguntar! Para detalhes de pagamento, envie um email para daniel@batesai.org e responderei rapidamente.",
+        "de": "Danke für die Anfrage! Für Zahlungsdetails schreiben Sie bitte an daniel@batesai.org — ich melde mich zeitnah.",
+        "fr": "Merci de demander ! Pour les détails de paiement, envoyez un email à daniel@batesai.org et je vous répondrai rapidement.",
+        "ar": "شكراً على السؤال! لتفاصيل الدفع، يرجى مراسلتي على daniel@batesai.org وسأرد عليك فوراً.",
+    },
+    "job_reply": {
+        "en": "Thank you for the opportunity! Please reach out to daniel@batesai.org and I'd be happy to discuss further.",
+        "zh": "感谢您提供的机会！请联系 daniel@batesai.org，我很乐意进一步讨论。",
+        "ja": "このような機会をいただきありがとうございます！daniel@batesai.org までご連絡いただければ、詳しくお話しできれば幸いです。",
+        "ko": "기회를 주셔서 감사합니다! daniel@batesai.org 로 연락해 주시면 자세히 논의하겠습니다.",
+        "ru": "Спасибо за предложение! Напишите на daniel@batesai.org — буду рад обсудить подробнее.",
+        "es": "¡Gracias por la oportunidad! Contacte a daniel@batesai.org y estaré encantado de discutirlo.",
+        "pt": "Obrigado pela oportunidade! Entre em contato pelo daniel@batesai.org e terei prazer em discutir mais.",
+        "de": "Danke für die Gelegenheit! Schreiben Sie an daniel@batesai.org — ich freue mich auf den Austausch.",
+        "fr": "Merci pour l'opportunité ! Contactez daniel@batesai.org et je serai ravi d'en discuter.",
+        "ar": "شكراً على الفرصة! يرجى التواصل على daniel@batesai.org وسأكون سعيداً بالمناقشة.",
+    },
+}
+
+
+def _get_translated(key: str, lang: str) -> str:
+    """Get a translated canned response, falling back to English."""
+    translations = _TRANSLATIONS.get(key, {})
+    return translations.get(lang, translations.get("en", ""))
 
 
 class FeedbackLoop:
@@ -150,6 +310,24 @@ class FeedbackLoop:
             if reviewer == self.username:
                 continue  # Skip our own comments
 
+            # Skip bot accounts — their comments are automated, not human feedback
+            user_type = item.get("user", {}).get("type", "")
+            reviewer_lower = reviewer.lower()
+            # Strip [bot] suffix for matching (e.g. "coderabbitai[bot]" -> "coderabbitai")
+            reviewer_base = reviewer_lower.replace("[bot]", "").rstrip("-")
+            known_bots = {"claassistant", "cla-assistant", "allcontributors", "dependabot",
+                          "renovate", "codecov", "coderabbitai", "github-actions",
+                          "autogpt-reviewer", "sonarcloud", "netlify", "vercel",
+                          "stale", "lock", "gitguardian", "sympy-bot", "autofix-ci",
+                          "codeclimate", "coveralls", "snyk-bot", "mergify",
+                          "imgbot", "greenkeeper", "percy", "cypress",
+                          "cloudflare-workers-and-pages", "linear", "sentry-io"}
+            if (user_type == "Bot" or reviewer.endswith("[bot]")
+                    or reviewer.endswith("-bot") or reviewer.endswith("-reviewer")
+                    or reviewer_base in known_bots
+                    or reviewer.startswith("github-actions")):
+                continue
+
             sentiment = self._classify_sentiment(body)
 
             # Record in DB
@@ -169,8 +347,11 @@ class FeedbackLoop:
             if action:
                 conn.execute(
                     """UPDATE pr_reviews SET action_taken = ?
-                       WHERE pr_url = ? AND reviewer = ?
-                       ORDER BY created_at DESC LIMIT 1""",
+                       WHERE rowid = (
+                           SELECT rowid FROM pr_reviews
+                           WHERE pr_url = ? AND reviewer = ?
+                           ORDER BY created_at DESC LIMIT 1
+                       )""",
                     (action, pr_url, reviewer),
                 )
                 conn.commit()
@@ -223,6 +404,13 @@ class FeedbackLoop:
         if any(kw in text_lower for kw in ANTI_AI_KEYWORDS):
             return "hostile"  # anti-AI treated as hostile for action purposes
 
+        # CLA/DCO-related text is constructive (not contact_request)
+        cla_signals = {"cla", "contributor license agreement", "contributor agreement",
+                       "generative ai agreement", "ai contribution agreement",
+                       "sign the agreement", "signed-off-by", "dco"}
+        if any(kw in text_lower for kw in cla_signals):
+            return "constructive"
+
         # Check for payment/job/contact requests (notify Daniel via Telegram)
         if any(kw in text_lower for kw in PAYMENT_KEYWORDS):
             return "payment_request"
@@ -239,9 +427,9 @@ class FeedbackLoop:
         if any(kw in text_lower for kw in REGRET_KEYWORDS):
             return "regretful"
 
-        # Check hostile
+        # Check hostile — require 3+ matches to avoid false positives
         hostile_count = sum(1 for kw in HOSTILE_KEYWORDS if kw in text_lower)
-        if hostile_count >= 2:
+        if hostile_count >= 3:
             return "hostile"
 
         # Check positive
@@ -288,37 +476,34 @@ class FeedbackLoop:
         owner_repo = "/".join(pr_url.split("/repos/")[1].split("/pulls/")[0:1]) if "/repos/" in pr_url else repo_full_name
         html_url = self._api_url_to_html(pr_url)
 
-        # --- Telegram notification sentiments ---
+        # Detect reviewer's language for localized responses
+        lang = _detect_language(body)
+
+        # --- ALWAYS notify Daniel for any human response ---
+        notify_github_attention(
+            sentiment, repo_full_name, html_url,
+            f"@{reviewer}: {body[:200]}"
+        )
+
+        # --- Take automated action based on sentiment ---
         if sentiment == "payment_request":
             self._comment_on_pr(
                 owner_repo, pr_number,
-                "Thanks for asking! For payment details, please email daniel@batesai.org and I'll get back to you promptly."
-            )
-            notify_github_attention(
-                "payment_request", repo_full_name, html_url,
-                f"From @{reviewer}: {body[:200]}"
+                _get_translated("payment_reply", lang),
             )
             return "telegram_notified"
 
         if sentiment == "job_inquiry":
             self._comment_on_pr(
                 owner_repo, pr_number,
-                "Thank you for the opportunity! Please reach out to daniel@batesai.org and I'd be happy to discuss further."
-            )
-            notify_github_attention(
-                "job_inquiry", repo_full_name, html_url,
-                f"From @{reviewer}: {body[:200]}"
+                _get_translated("job_reply", lang),
             )
             return "telegram_notified"
 
         if sentiment == "contact_request":
             self._comment_on_pr(
                 owner_repo, pr_number,
-                "Thanks for reaching out! The best way to contact me is daniel@batesai.org."
-            )
-            notify_github_attention(
-                "contact_request", repo_full_name, html_url,
-                f"From @{reviewer}: {body[:200]}"
+                _get_translated("contact_reply", lang),
             )
             return "telegram_notified"
 
@@ -327,39 +512,51 @@ class FeedbackLoop:
             add_sponsor(conn, reviewer, repo_full_name, "comment",
                         json.dumps({"quote": body[:500]}))
             self._comment_on_pr(owner_repo, pr_number,
-                                "Thank you so much for the kind words and support! 🙏")
-            notify_github_attention(
-                "payment_request", repo_full_name, html_url,
-                f"Sponsor offer from @{reviewer}: {body[:200]}"
-            )
+                                _get_translated("sponsor_thanks", lang))
             return "thanked"
 
-        # --- Standard sentiments ---
         if sentiment == "positive":
             self._react_to_comment(owner_repo, comment_id, "+1")
             self._comment_on_pr(owner_repo, pr_number,
-                                "Thank you for the review! Glad it helps. 🙏")
+                                _get_translated("thank_review", lang))
             return "thanked"
 
         elif sentiment == "constructive":
-            # Log for potential re-fix
+            # Check if this is CLA/DCO related — agent can't sign agreements
+            body_lower = body.lower()
+            cla_signals = {"cla", "contributor license agreement", "sign the agreement",
+                           "signed-off-by", "dco", "contributor agreement",
+                           "generative ai agreement", "ai contribution agreement"}
+            is_cla = any(kw in body_lower for kw in cla_signals)
+
+            if is_cla:
+                action_note = "CLA/DCO request — requires manual signing by Daniel"
+            else:
+                # Queue for automated re-fix: find matching contribution and mark needs_revision
+                contribution = get_contribution_by_pr_url(conn, html_url)
+                if contribution:
+                    update_feedback_status(
+                        conn, contribution["id"],
+                        status="needs_revision",
+                        feedback_text=body[:5000],
+                        feedback_pr_url=html_url,
+                        feedback_reviewer=reviewer,
+                        mandatory_model="opus-high",
+                    )
+                    action_note = "Queued for automated revision (priority #1)"
+                else:
+                    action_note = "No matching contribution found — manual review needed"
+
+            # Log for tracking
             self.log_writer.append_entry(
                 f"## {datetime.now().strftime('%Y-%m-%d %H:%M')} — REVIEW RECEIVED\n"
                 f"**Repo:** {repo_full_name}\n"
                 f"**PR:** #{pr_number}\n"
                 f"**Reviewer:** {reviewer}\n"
                 f"**Feedback:** {body[:300]}\n"
-                f"**Action needed:** Yes — review and potentially re-fix\n"
+                f"**Action:** {action_note}\n"
                 f"---"
             )
-
-            # Notify via Telegram if it looks like a question
-            body_lower = body.lower()
-            if "?" in body and any(w in body_lower for w in ["why", "how", "what", "can you", "could you", "would you"]):
-                notify_github_attention(
-                    "question", repo_full_name, html_url,
-                    f"Question from @{reviewer}: {body[:200]}"
-                )
 
             # Check for learned patterns
             self._check_for_patterns(body, repo_full_name)
@@ -371,8 +568,9 @@ class FeedbackLoop:
             body_lower = body.lower()
             is_anti_ai = any(kw in body_lower for kw in ANTI_AI_KEYWORDS)
 
-            # Polite exit
-            self._comment_on_pr(owner_repo, pr_number, POLITE_EXIT)
+            # Polite exit in reviewer's language
+            self._comment_on_pr(owner_repo, pr_number,
+                                _get_translated("polite_exit", lang))
 
             # Close PR
             self._close_pr(owner_repo, pr_number)

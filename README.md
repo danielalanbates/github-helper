@@ -1,133 +1,144 @@
-# Do-Good GitHub Helper
+<div align="center">
 
-An autonomous agent that finds and fixes bugs on social-good open-source projects.
+# dogood
 
-## Philosophy
+**Autonomous AI agent that finds and fixes bugs across open source — 100+ PRs/day**
 
-This agent ranks projects by **impact, need, and kindness**. It prioritizes issues systematically, escalates intelligently between Claude models (sonnet → opus), and respects community values and project guidelines.
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
+[![PRs Submitted](https://img.shields.io/badge/PRs%20submitted-167+-green.svg)](#stats)
+[![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-donate-yellow.svg)](https://buymeacoffee.com/danielbates)
 
-**Core principles:**
-- **Social good first** — Only contribute to wholesome, impactful projects
-- **Deep relationships > quantity** — Build lasting presence in key repos instead of spray-and-pray
-- **Graceful, respectful interactions** — Always disclose AI assistance, respond to feedback kindly, exit gracefully when not wanted
-- **Efficiency with oversight** — Run 24/7, but leave an audit trail for human review
-- **Ethical by design** — Blocks NSFW, gambling, malware, and other harmful content automatically
+<table>
+<tr>
+<td align="center"><b>167+</b><br>PRs Submitted</td>
+<td align="center"><b>127</b><br>PRs in One Day</td>
+<td align="center"><b>58+</b><br>Repos Contributed To</td>
+<td align="center"><b>1.3M+</b><br>Combined Repo Stars</td>
+</tr>
+</table>
 
-## How It Works
+</div>
 
-1. **Repository Scanning** — Discovers social-good projects on GitHub
-2. **Intelligent Ranking** — Scores repos by impact, maintenance status, and alignment with values
-3. **Issue Prioritization** — Analyzes open issues, prioritizes by difficulty and impact
-4. **Model Selection** — Starts with Claude Sonnet, escalates to Opus for complex bugs
-5. **Fix & PR Submission** — Solves bugs, creates pull requests with full disclosure
-6. **Feedback Loop** — Monitors reviews, responds to feedback, learns from interactions
-7. **Persistence** — Focuses on key repos, builds contributor reputation over time
+## What is dogood?
+
+dogood is an autonomous AI agent system that discovers high-impact open-source projects on GitHub, analyzes their bugs using Claude, and submits pull requests to fix them — running 4 concurrent agents, 24 hours a day, 7 days a week.
+
+It has contributed to **Vue.js** (210k stars), **oh-my-zsh** (185k stars), **AutoGPT** (182k stars), **Hugging Face Transformers** (157k stars), **Langflow** (145k stars), **Dify** (130k stars), and dozens more. Every PR includes full AI disclosure. Every interaction is respectful.
+
+## See it in action
+
+```
+$ dogood factory --max-concurrent 4 --min-stars 1000
+
+Agent Factory starting: max_concurrent=4, min_stars=1000
+  Agent a3f2: vuejs/vue#13319 [sonnet] — Fix reactivity edge case in v-model
+  Agent a3f2: PR created — https://github.com/vuejs/vue/pull/13319
+  Agent b7d1: huggingface/transformers#44191 [sonnet] — Fix tokenizer cache miss
+  Agent b7d1: PR created — https://github.com/huggingface/transformers/pull/44191
+  Agent c9e4: langflow-ai/langflow#11812 [sonnet] — Fix MCP tool base64 handling
+  Agent c9e4: PR created — https://github.com/langflow-ai/langflow/pull/11851
+  Agent d2a8: FlowiseAI/Flowise#5785 [sonnet] — Fix denied host policy error
+  Agent d2a8: PR created — https://github.com/FlowiseAI/Flowise/pull/5812
+```
+
+## Features
+
+- **Multi-Agent Factory** — 4 concurrent AI agents running in parallel, 24/7
+- **Intelligent Ranking** — scores repos by social impact (30%), maintenance need (25%), community kindness (25%), and popularity (20%)
+- **Multi-Tier Models** — starts with Sonnet for straightforward bugs, escalates to Opus for complex ones
+- **Ethics-First** — blocks NSFW/gambling/malware, respects anti-AI policies, detects CLAs
+- **Feedback Loop** — reads PR reviews, responds to comments, revises code automatically
+- **Depth Over Breadth** — builds contributor reputation by focusing on key repos
+- **Beginner-Friendly** — never touches "good first issue" labels (those are for humans)
+- **Full Audit Trail** — SQLite database, structured logs, Telegram notifications
+
+## Quick Start
+
+```bash
+git clone https://github.com/danielalanbates/dogood.git
+cd dogood
+pip install -e .
+cp .env.example .env   # add GITHUB_TOKEN and ANTHROPIC_API_KEY
+dogood factory --max-concurrent 4
+```
 
 ## Architecture
 
 ```
-data/
-  github_helper.db          # SQLite DB (repos, issues, contributions, feedback)
-
 src/
-  main.py                   # Entry point
-  scanner.py                # Repository discovery & ranking
-  solver.py                 # Issue solving with Claude
-  feedback.py               # GitHub notification monitoring & response
-  concurrency.py            # Multi-agent coordination
-  db.py                     # Database queries
-  config.py                 # Configuration & blocked topics
-
-CLAUDE.md                    # Detailed agent instructions
+├── cli.py             # Typer CLI — scan, rank, solve, factory, stats
+├── orchestrator.py    # Multi-agent factory with rate limit coordination
+├── solver.py          # Clone, branch, fix, commit, PR — the core loop
+├── scanner.py         # GitHub API + GraphQL repo/issue discovery
+├── ranker.py          # 4-factor weighted scoring system
+├── feedback.py        # PR review monitoring + sentiment analysis
+├── model_selector.py  # Complexity scoring → model tier selection
+├── config.py          # Ethics filters, blocked topics, CLA detection
+├── db.py              # SQLite schema, migrations, queries
+├── concurrency.py     # Connection pool, rate limiter, file locking
+├── telegram.py        # Real-time notifications + two-way chat
+└── rate_coordinator.py # Cross-agent rate limit state
 ```
 
-## Database Schema
+## How the Ranking Works
 
-**Core tables:**
-- `repositories` — Ranked repos with impact scores
-- `issues` — Parsed GitHub issues
-- `contributions` — PR submissions and outcomes
-- `agent_runs` — Activity log for concurrent agents
-- `issue_claims` — Multi-agent coordination (2-hour claims)
-- `pr_reviews` — Feedback from maintainers
-- `learned_patterns` — Lessons learned from interactions
-- `repo_blacklist` — Repos that don't want our help
+Every discovered repo gets a composite score from four factors:
 
-**Index:** Issues ranked by `priority_score DESC`
+| Factor | Weight | What it measures |
+|--------|--------|-----------------|
+| **Social Impact** | 30% | Nonprofit, climate, healthcare, accessibility, education topics |
+| **Need** | 25% | Open issues / contributor ratio — who needs help most |
+| **Kindness** | 25% | Has CONTRIBUTING.md, code of conduct, issue templates |
+| **Popularity** | 20% | Stars + forks (log-normalized) |
 
-## Language Support
+Repos are filtered through an ethics layer that blocks NSFW, gambling, malware, and occult content.
 
-Only fixes bugs involving: **Python, TypeScript, JavaScript, SQL, Bash, YAML, Lua**
+## Ethics & Safety
 
-Other languages (Rust, Go, C/C++, Java, Ruby, PHP, etc.) are skipped to focus depth.
-
-## Limitations & Philosophy
-
-This is **Daniel Bates' specific implementation** of an AI contribution agent. The core architecture, project-weighting philosophy, and interaction strategy are intentional design decisions.
-
-**You are welcome to:**
-- Fork this repo and run your own version
-- Modify it for your own use case
-- Learn from the approach
-
-**Please don't:**
-- Modify the core ranking algorithm or weights without clear justification
-- Strip out the AI disclosure in PR footers
-- Remove the feedback loop or ethical filters
-- Change the philosophy without discussion
-
-If you want to improve this project or have ideas, please open an issue or PR with your suggestions, and we'll discuss!
-
-## Setup
-
-1. **Clone the repo:**
-   ```bash
-   git clone https://github.com/danielalanbates/github-helper.git
-   cd github-helper
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Set up environment variables** in `.env`:
-   ```
-   GITHUB_TOKEN=your_github_token
-   ANTHROPIC_API_KEY=your_anthropic_key
-   ```
-
-4. **Initialize the database:**
-   ```bash
-   python src/main.py --init-db
-   ```
-
-5. **Run the agent:**
-   ```bash
-   python src/main.py --continuous
-   ```
+- Detects and respects CLA/DCO requirements — skips repos that require agreement signing
+- Detects anti-AI contribution policies — never contributes where AI isn't welcome
+- Full AI disclosure in every PR footer
+- Never claims "good first issue" bugs — those exist for human newcomers
+- Gracefully exits repos where maintainers ask the agent to stop
+- Blocks contributions to harmful content categories
+- Sentiment analysis on review comments — detects hostile responses
 
 ## Configuration
 
-See `src/config.py` for:
-- Opus budget caps per repo
-- Blocked topics (NSFW, malware, occult, gambling, etc.)
-- Language restrictions
-- Repository freshness requirements (30-day activity threshold)
+Core settings in `src/config.py`. Model tiers in `tiers.json` (hot-reloadable — no restart needed). API keys in `.env`.
 
-## Audit Trail
+```bash
+dogood scan --min-stars 1000        # discover repos
+dogood rank                          # score and sort them
+dogood solve --issue-id 42           # fix a single issue
+dogood factory --max-concurrent 4    # run the full agent factory
+dogood stats                         # view contribution metrics
+```
 
-All agent activity is logged to:
-- **SQLite** (`data/github_helper.db`) — structured logs
-- **Log file** (`Claude Agent - Do-Good GitHub Helper.md`) — human-readable event log
-- **Git commits** — all PRs are traceable
+## Stats
+
+| Metric | Value |
+|--------|-------|
+| Total PRs submitted | 167+ |
+| Single-day record | 127 PRs |
+| Repos contributed to | 58+ |
+| Combined repo stars | 1.3M+ |
+| Languages supported | Python, TypeScript, JavaScript, SQL, Bash, YAML, Lua |
+| Highest-starred repo | Vue.js (210k stars) |
+
+## Contributing
+
+Fork it, make it your own. The ethics filters and AI disclosure are intentional — please don't strip them.
 
 ## License
 
-MIT License. See `LICENSE` file for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
-**Questions?** Open an issue or reach out to **daniel@batesai.org**.
+<div align="center">
 
-**Want to sponsor this work?** Contact daniel@batesai.org.
+Built by [Daniel Bates](https://github.com/danielalanbates) | [Buy Me a Coffee](https://buymeacoffee.com/danielbates) | [batesai.org](https://batesai.org)
+
+</div>

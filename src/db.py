@@ -461,8 +461,12 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
     - Stale issues (>2yr old)
     - Repos not maintained in last 30 days
     """
-    from src.config import SUPPORTED_LANGUAGES, BEGINNER_LABELS, BOUNTY_LABELS
+    from src.config import SUPPORTED_LANGUAGES, BEGINNER_LABELS, BOUNTY_LABELS, CLA_ORGS, SIGNED_CLA_ORGS
     lang_placeholders = ",".join("?" for _ in SUPPORTED_LANGUAGES)
+    # Pre-filter CLA orgs at the query level (skip before forking/cloning)
+    cla_orgs_to_skip = {o.lower() for o in CLA_ORGS} - {o.lower() for o in SIGNED_CLA_ORGS}
+    cla_excludes = " AND ".join("LOWER(r.owner) != ?" for _ in cla_orgs_to_skip) if cla_orgs_to_skip else "1=1"
+    cla_params = list(cla_orgs_to_skip)
     # Build LIKE clauses to exclude beginner-labeled issues
     beginner_excludes = " AND ".join(
         "LOWER(i.labels) NOT LIKE ?" for _ in BEGINNER_LABELS
@@ -473,7 +477,8 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
         "LOWER(i.labels) LIKE ?" for _ in BOUNTY_LABELS
     )
     bounty_params = [f'%{label}%' for label in BOUNTY_LABELS]
-    params = list(SUPPORTED_LANGUAGES) + [min_stars] + beginner_params + bounty_params
+    # bounty_params go FIRST because the CASE WHEN is in the SELECT clause (before WHERE)
+    params = bounty_params + list(SUPPORTED_LANGUAGES) + [min_stars] + beginner_params + cla_params
 
     row = conn.execute(f"""
         SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
@@ -506,6 +511,7 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
           AND (r.pushed_at IS NULL OR r.pushed_at > datetime('now', '-30 days'))
           AND COALESCE(rs.strikes, 0) < 10
           AND (rs.cooldown_until IS NULL OR rs.cooldown_until < datetime('now'))
+          AND {cla_excludes}
         ORDER BY
           is_bounty DESC,
           is_sponsor DESC,
@@ -515,6 +521,49 @@ def get_next_unclaimed_issue(conn: sqlite3.Connection, min_stars: int = 1000) ->
                THEN julianday('now') - julianday(rs.last_merge_at)
                ELSE 9999 END ASC,
           r.combined_score DESC,
+          i.priority_score DESC
+        LIMIT 1
+    """, params).fetchone()
+    return dict(row) if row else None
+
+
+def get_next_tagged_issue(conn: sqlite3.Connection, tag: str,
+                          min_stars: int = 0) -> dict | None:
+    """Get the next unclaimed issue from repos with a specific tag.
+
+    Used to reserve agent slots for priority categories like 'christian'.
+    Falls back to highest-star repos first, then most open issues.
+    """
+    from src.config import SUPPORTED_LANGUAGES, CLA_ORGS, SIGNED_CLA_ORGS
+    lang_placeholders = ",".join("?" for _ in SUPPORTED_LANGUAGES)
+    cla_orgs_to_skip = {o.lower() for o in CLA_ORGS} - {o.lower() for o in SIGNED_CLA_ORGS}
+    cla_excludes = " AND ".join("LOWER(r.owner) != ?" for _ in cla_orgs_to_skip) if cla_orgs_to_skip else "1=1"
+    cla_params = list(cla_orgs_to_skip)
+    params = list(SUPPORTED_LANGUAGES) + [f'%"{tag}"%', min_stars] + cla_params
+
+    row = conn.execute(f"""
+        SELECT i.*, r.full_name, r.language, r.stars, r.owner, r.name as repo_name,
+               r.url as repo_url, r.id as rid, r.combined_score,
+               0 as is_sponsor, 0 as repo_merges, 0 as repo_strikes,
+               NULL as last_merge_at, 0 as is_bounty, 0 as is_focus_repo
+        FROM issues i
+        JOIN repositories r ON i.repo_id = r.id
+        LEFT JOIN repo_strikes rs ON r.id = rs.repo_id
+        WHERE i.state = 'open'
+          AND i.is_assigned = 0
+          AND r.language IN ({lang_placeholders})
+          AND r.tags LIKE ?
+          AND r.stars >= ?
+          AND r.full_name NOT IN (SELECT full_name FROM repo_blacklist WHERE forgiven_at IS NULL)
+          AND i.id NOT IN (SELECT issue_id FROM issue_claims WHERE status = 'active')
+          AND i.id NOT IN (SELECT issue_id FROM contributions WHERE issue_id IS NOT NULL)
+          AND i.updated_at > datetime('now', '-2 years')
+          AND COALESCE(rs.strikes, 0) < 10
+          AND (rs.cooldown_until IS NULL OR rs.cooldown_until < datetime('now'))
+          AND {cla_excludes}
+        ORDER BY
+          r.stars DESC,
+          r.open_issues DESC,
           i.priority_score DESC
         LIMIT 1
     """, params).fetchone()
@@ -612,6 +661,71 @@ def get_loyalty_repos(conn: sqlite3.Connection, limit: int = 20) -> list:
         ORDER BY rs.merges DESC, r.combined_score DESC
         LIMIT ?
     """, (limit,)).fetchall()
+
+
+# --- Feedback revision queue ---
+
+def get_next_feedback_revision(conn: sqlite3.Connection) -> dict | None:
+    """Get the oldest contribution needing revision from reviewer feedback.
+
+    Returns the full contribution row joined with repo/issue info, or None.
+    This is checked BEFORE normal issue selection — feedback is priority #1.
+    """
+    row = conn.execute("""
+        SELECT c.*, r.full_name, r.owner, r.name as repo_name, r.url as repo_url,
+               i.number as issue_number, i.title as issue_title
+        FROM contributions c
+        LEFT JOIN repositories r ON c.repo_id = r.id
+        LEFT JOIN issues i ON c.issue_id = i.id
+        WHERE c.feedback_status = 'needs_revision'
+          AND c.pr_url IS NOT NULL
+        ORDER BY c.created_at ASC
+        LIMIT 1
+    """).fetchone()
+    return dict(row) if row else None
+
+
+def update_feedback_status(conn: sqlite3.Connection, contribution_id: int,
+                           status: str, feedback_text: str = None,
+                           feedback_pr_url: str = None,
+                           feedback_reviewer: str = None,
+                           mandatory_model: str = None) -> None:
+    """Update the feedback status and optional feedback details on a contribution."""
+    updates = ["feedback_status = ?", "updated_at = ?"]
+    params = [status, now_iso()]
+
+    if feedback_text is not None:
+        updates.append("feedback_text = ?")
+        params.append(feedback_text[:5000])
+    if feedback_pr_url is not None:
+        updates.append("feedback_pr_url = ?")
+        params.append(feedback_pr_url)
+    if feedback_reviewer is not None:
+        updates.append("feedback_reviewer = ?")
+        params.append(feedback_reviewer)
+    if mandatory_model is not None:
+        updates.append("mandatory_model = ?")
+        params.append(mandatory_model)
+
+    params.append(contribution_id)
+    conn.execute(
+        f"UPDATE contributions SET {', '.join(updates)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+
+
+def get_contribution_by_pr_url(conn: sqlite3.Connection, pr_url: str) -> dict | None:
+    """Find a contribution by its PR URL (API or HTML format)."""
+    # Normalize: try both API and HTML URL formats
+    html_url = pr_url.replace("https://api.github.com/repos/", "https://github.com/").replace("/pulls/", "/pull/")
+    api_url = pr_url.replace("https://github.com/", "https://api.github.com/repos/").replace("/pull/", "/pulls/")
+
+    row = conn.execute(
+        "SELECT * FROM contributions WHERE pr_url IN (?, ?, ?) ORDER BY created_at DESC LIMIT 1",
+        (pr_url, html_url, api_url),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def get_learned_patterns(conn: sqlite3.Connection, repo_full_name: str = None) -> list:

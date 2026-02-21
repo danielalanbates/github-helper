@@ -3,10 +3,20 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
-name = "github-do-good-agent"
-version = "0.1.0"
-description = "Autonomous agent that finds and fixes bugs on social-good GitHub projects"
+name = "dogood"
+version = "0.2.0"
+description = "Autonomous AI agent that finds and fixes bugs across open source"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
+keywords = ["ai-agent", "open-source", "github", "autonomous", "claude", "bug-fix", "pull-request"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Bug Tracking",
+]
 dependencies = [
     "ghapi>=1.0.6",
     "claude-agent-sdk>=0.1.0",
@@ -21,3 +31,8 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 dogood = "src.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/danielalanbates/dogood"
+Repository = "https://github.com/danielalanbates/dogood"
+Issues = "https://github.com/danielalanbates/dogood/issues"

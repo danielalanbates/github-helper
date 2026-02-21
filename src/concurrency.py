@@ -160,7 +160,7 @@ class LogWriter:
 
         if not self._log_path.exists():
             self._log_path.write_text(
-                "# Claude Agent - Do-Good GitHub Helper\n\n"
+                "# Claude Agent - dogood\n\n"
             )
 
         with open(self._log_path, "r+") as f:

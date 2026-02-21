@@ -1,14 +1,14 @@
-# Do-Good GitHub Helper - Agent Instructions
+# dogood - Agent Instructions
 
 ## Project Overview
 Autonomous agent that finds social-good open-source projects, ranks them by impact/need/kindness, prioritizes issues, and creates pull requests to fix bugs using AI assistance.
 
 ## Working Directory
-This project lives on the X10 drive at `/Users/daniel/X10/AIcode/github-helper/`.
+This project lives on the X10 drive at `/Users/daniel/X10/AIcode/dogood/`.
 
 ## Communication Protocol
 
-**Log file:** `Claude Agent - Do-Good GitHub Helper.md` (in this project directory)
+**Log file:** `Claude Agent - dogood.md` (in this project directory)
 
 When you want to communicate something important to Daniel, write a timestamped entry at the **top** of the log file. Daniel will check this file to see what happened while you were working.
 
@@ -233,7 +233,7 @@ Issues labeled "good first issue", "beginner", "first-timers-only", "easy", "sta
 Issues tagged with "bounty", "reward", "paid", or "cash" get **immediate priority** and are always solved with **opus** regardless of complexity. These represent real financial opportunities. Only grab bounties posted in the last **10 minutes** — speed is everything.
 
 ### Bounty Watch Daemon
-`dogood bountywatch` polls GitHub Search API every 5 min (conservative while CLA scanner runs). **TODO: Increase to every 90s once CLA scan finishes.** The daemon auto-upserts repos/issues and solves immediately with opus.
+`dogood bountywatch` polls GitHub Search API every 90s. The daemon auto-upserts repos/issues and solves immediately with opus.
 
 ## Language Restrictions
 Only fix bugs in repos where the fix involves these languages: SQL, Bash, TypeScript, JavaScript, Python, YAML, Lua. Skip repos whose primary codebase or required fix is in other languages (Rust, Go, C/C++, Java, Ruby, PHP, etc.).

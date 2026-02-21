@@ -1,4 +1,4 @@
-"""Configuration management for the Do-Good GitHub Agent."""
+"""Configuration management for dogood."""
 
 import os
 import subprocess
@@ -32,7 +32,7 @@ GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 
 # --- Paths ---
 DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "github_helper.db"
+DB_PATH = DATA_DIR / "github_helper.db"  # Legacy name kept for backward compatibility
 WORK_DIR = Path(os.getenv("WORK_DIR", "/tmp/dogood-workdir"))
 SEED_DATA_PATH = PROJECT_ROOT / "awesome-for-beginners" / "data.json"
 
@@ -95,6 +95,16 @@ ANTI_AI_KEYWORDS = {
     "no chatgpt", "no claude", "llm-generated",
 }
 
+# --- Manually Blocked Orgs/Repos ---
+# Repos or orgs that silently closed/locked our PRs (anti-AI policy not documented).
+BLOCKED_ORGS = {
+    "mrdoob",  # three.js — closes and locks AI PRs without comment
+    "ChatGPTNextWeb",  # NextChat — silently closes all PRs
+}
+BLOCKED_REPOS = {
+    "LibreTranslate/LibreTranslate",  # silently closes PRs
+}
+
 # --- Supported Languages ---
 # We only fix bugs in repos whose primary language is one of these.
 SUPPORTED_LANGUAGES = {
@@ -123,45 +133,66 @@ UNSUPPORTED_EXTENSIONS = {
 }
 
 # --- CLA/DCO Detection ---
-# Keywords that indicate a repo requires a CLA (Contributor License Agreement)
-# or DCO (Developer Certificate of Origin) sign-off. We skip these repos
-# unless we've already signed their CLA.
+# Only catch repos that EXPLICITLY REQUIRE signing a CLA to contribute.
+# We want enforcement language ("must sign", "required to sign", "please sign")
+# near CLA mentions — NOT informational mentions like "we have a CLA".
+
+# Definite enforcement phrases (substring match, no context needed)
 CLA_KEYWORDS = {
-    "contributor license agreement", "cla", "contributor agreement",
-    "sign the cla", "signed cla", "cla-assistant", "cla assistant",
-    "license agreement", "individual contributor license",
-    "corporate contributor license",
+    "cla-assistant",              # CLA bot that blocks PRs
+    "cla assistant",              # Same bot, different formatting
+    "sign the cla",               # Direct instruction to sign
+    "sign a cla",                 # Direct instruction to sign
+    "sign our cla",               # Direct instruction to sign
+    "must sign the contributor",  # "must sign the contributor license agreement"
+    "required to sign a contributor", # Enforcement language
+    "generative ai agreement",   # AI-specific contributor agreement
+    "ai contribution agreement",  # AI-specific contributor agreement
+    "ai policy agreement",        # AI policy before contributing
 }
+
+# Contextual regex: enforcement language near CLA/contributor agreement
+# These catch phrases like "you must sign a CLA before submitting"
+CLA_CONTEXTUAL_PATTERNS = [
+    # "must/need to/required to/have to/please sign [a/the/our] CLA"
+    r'(?:must|need to|required to|have to|please)\s+sign\s+(?:a\s+|the\s+|our\s+)?(?:cla\b|contributor\s+(?:license\s+)?agreement)',
+    # "CLA must/needs to/is required to be signed"
+    r'\bcla\b\s+(?:must|needs? to|is required to)\s+be\s+signed',
+    # "signing (?:a|the|our) CLA is required/mandatory/necessary"
+    r'signing\s+(?:a\s+|the\s+|our\s+)?(?:cla\b|contributor\s+(?:license\s+)?agreement)\s+is\s+(?:required|mandatory|necessary)',
+    # "submit/accept/complete (?:a|the|our) contributor license agreement"
+    r'(?:submit|accept|complete)\s+(?:a\s+|the\s+|our\s+)?contributor\s+license\s+agreement',
+    # "PRs require a signed CLA" / "contributions require signing a CLA"
+    r'(?:pull requests?|prs?|contributions?)\s+(?:\w+\s+){0,3}require\s+(?:\w+\s+){0,2}(?:sign|cla\b|contributor\s+(?:license\s+)?agreement)',
+]
+
 DCO_KEYWORDS = {
-    "developer certificate of origin", "dco", "signed-off-by",
-    "sign-off", "signoff",
+    "developer certificate of origin",
+    "signed-off-by",
 }
-# Workflow files that indicate CLA/DCO enforcement
+
+# Workflow files that enforce CLA/DCO (these actively block PRs)
 CLA_WORKFLOW_FILES = [
     ".github/workflows/cla.yml",
     ".github/workflows/cla.yaml",
+]
+DCO_WORKFLOW_FILES = [
     ".github/workflows/dco.yml",
     ".github/workflows/dco.yaml",
 ]
 
-# Organizations known to require CLAs — skip ALL repos in these orgs
-# unless we've explicitly signed their CLA
+# Org-level CLA blocklist — these orgs require CLAs across all/most repos.
+# Populated from confirmed blacklist data (repos that already hit CLA detection).
+# Per-repo CONTRIBUTING.md scan still catches any we miss here.
 CLA_ORGS = {
-    "google", "googleapis", "angular", "tensorflow",  # Google CLA
-    "microsoft", "azure", "dotnet",                    # Microsoft CLA
-    "apache",                                          # Apache ICLA
-    "eclipse",                                         # Eclipse ECA
-    "salesforce",                                      # Salesforce CLA
-    "SAP",                                             # SAP CLA
-    "Shopify",                                         # Shopify CLA
-    "hashicorp",                                       # HashiCorp CLA
-    "chef",                                            # Chef CLA
-    "adobe",                                           # Adobe CLA
-    "dequelabs",                                       # Deque CLA (axe-core)
-    "brave",                                           # Brave CLA
-    "home-assistant",                                  # Home Assistant CLA
-    "processing",                                      # Processing Foundation CLA
-    "mlflow",                                          # MLflow CLA (Linux Foundation)
+    "microsoft", "google", "apache", "dotnet", "tensorflow",
+    "facebookresearch", "hashicorp", "Shopify", "Azure", "googleapis",
+    "salesforce", "angular", "google-deepmind", "facebookarchive",
+    "GoogleChrome", "google-research", "adobe", "grafana",
+    "googlecolab", "google-gemini", "googlesamples", "googleworkspace",
+    "GoogleCloudPlatform", "eclipse", "SAP", "chef",
+    "TransformerOptimus",
+    "n8n-io", "Significant-Gravitas", "rabbitmq",
 }
 
 # Organizations where we HAVE signed the CLA
@@ -170,38 +201,41 @@ SIGNED_CLA_ORGS = {
 }
 
 # --- Multi-Agent Factory ---
-MAX_CONCURRENT_AGENTS = int(os.getenv("MAX_CONCURRENT_AGENTS", "1"))  # Tier 1 = 50 RPM, only 1 agent at a time
+MAX_CONCURRENT_AGENTS = int(os.getenv("MAX_CONCURRENT_AGENTS", "4"))  # 4 agents at sonnet-low
 AGENT_CLAIM_TTL_MINUTES = 120
 MIN_STARS_DEFAULT = 1000  # lowered from 10000
 FEEDBACK_POLL_INTERVAL_SECONDS = 300
 HOSTILE_SENTIMENT_THRESHOLD = 0.7
 MAX_OPUS_PER_ISSUE = 10  # max opus attempts per individual issue before capping at sonnet
 
-# --- Model Tiers ---
-# Start with Sonnet (no haiku). Escalate to Opus only for reviews/complaints.
-MODEL_TIERS = [
-    {
-        "tier": 1,
-        "model": "claude-sonnet-4-6",
-        "effort": "medium",
-        "label": "sonnet-medium",
-        "description": "All issues, single-file and multi-file bugs",
-    },
-    {
-        "tier": 2,
-        "model": "claude-sonnet-4-6",
-        "effort": "high",
-        "label": "sonnet-high",
-        "description": "Complex multi-file bugs, refactoring",
-    },
-    {
-        "tier": 3,
-        "model": "claude-opus-4-6",
-        "effort": "high",
-        "label": "opus-high",
-        "description": "Reviewer complaints, quality re-fixes, architectural",
-    },
-]
+# --- Model Tiers (Daniel Tier System) ---
+# Edit tiers.json in the project root to change tiers live — no restart needed.
+# The factory hot-reloads this file on each agent spawn.
+TIERS_FILE = PROJECT_ROOT / "tiers.json"
+_tiers_cache: dict = {"mtime": 0.0, "tiers": []}
+
+
+def load_model_tiers() -> list[dict]:
+    """Load model tiers from tiers.json, hot-reloading when file changes."""
+    import json as _json
+    try:
+        mtime = TIERS_FILE.stat().st_mtime
+        if mtime != _tiers_cache["mtime"]:
+            _tiers_cache["tiers"] = _json.loads(TIERS_FILE.read_text())
+            _tiers_cache["mtime"] = mtime
+        return _tiers_cache["tiers"]
+    except Exception:
+        pass
+    # Fallback if file missing/corrupt
+    return [
+        {"tier": 1, "model": "claude-sonnet-4-6", "effort": "low", "label": "sonnet-low"},
+        {"tier": 2, "model": "claude-sonnet-4-6", "effort": "high", "label": "sonnet-high"},
+        {"tier": 3, "model": "claude-opus-4-6", "effort": "high", "label": "opus-high"},
+    ]
+
+
+# Initial load — but consumers should call load_model_tiers() for fresh data
+MODEL_TIERS = load_model_tiers()
 
 # --- Log file ---
-LOG_FILE = PROJECT_ROOT / "Claude Agent - Do-Good GitHub Helper.md"
+LOG_FILE = PROJECT_ROOT / "Claude Agent - dogood.md"

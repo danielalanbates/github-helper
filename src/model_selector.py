@@ -2,7 +2,7 @@
 
 import json
 import math
-from src.config import MODEL_TIERS, MAX_OPUS_PER_ISSUE
+from src.config import load_model_tiers, MAX_OPUS_PER_ISSUE
 
 
 # Keywords that signal simple issues
@@ -116,37 +116,39 @@ def score_complexity(issue: dict, repo: dict = None) -> float:
 def select_tier(complexity: float, issue_id: int = None, conn = None) -> dict:
     """Select the appropriate model tier based on complexity score.
 
-    Args:
-        complexity: 0.0–1.0 complexity score
-        issue_id: the issue being fixed (for per-issue opus budget checking)
-        conn: database connection (required if issue_id is provided)
-
-    Returns:
-        Model tier dict from MODEL_TIERS
+    Maps complexity to tier index proportionally across available tiers.
     """
-    if complexity <= 0.25:
-        tier_idx = 0  # sonnet medium (was haiku, but we avoid haiku)
-    elif complexity <= 0.50:
-        tier_idx = 1  # sonnet medium
+    tiers = load_model_tiers()
+    n = len(tiers)
+
+    if complexity <= 0.40:
+        tier_idx = 0
+    elif complexity <= 0.55:
+        tier_idx = min(1, n - 1)
     elif complexity <= 0.75:
-        tier_idx = 2  # sonnet high
+        tier_idx = min(n - 2, n - 1)
     else:
-        tier_idx = 3  # opus
+        tier_idx = n - 1
 
     # Enforce opus budget per issue
-    if tier_idx == 3 and issue_id and conn:
+    if "opus" in tiers[tier_idx]["model"] and issue_id and conn:
         from src.db import get_opus_attempts_for_issue
         opus_attempts = get_opus_attempts_for_issue(conn, issue_id)
         if opus_attempts >= MAX_OPUS_PER_ISSUE:
-            tier_idx = 2  # downgrade to sonnet high
+            # Find highest non-opus tier
+            for i in range(tier_idx - 1, -1, -1):
+                if "opus" not in tiers[i]["model"]:
+                    tier_idx = i
+                    break
 
-    return MODEL_TIERS[tier_idx].copy()
+    return tiers[tier_idx].copy()
 
 
 def get_next_tier(current_tier: dict) -> dict | None:
     """Get the next tier up for escalation. Returns None if already at max."""
+    tiers = load_model_tiers()
     current_tier_num = current_tier["tier"]
-    for t in MODEL_TIERS:
+    for t in tiers:
         if t["tier"] == current_tier_num + 1:
             return t.copy()
     return None
@@ -154,7 +156,8 @@ def get_next_tier(current_tier: dict) -> dict | None:
 
 def get_tier_by_number(tier_num: int) -> dict | None:
     """Get a specific tier by number."""
-    for t in MODEL_TIERS:
+    tiers = load_model_tiers()
+    for t in tiers:
         if t["tier"] == tier_num:
             return t.copy()
     return None

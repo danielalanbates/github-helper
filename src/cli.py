@@ -1,15 +1,17 @@
-"""Main CLI entry point for the Do-Good GitHub Agent."""
+"""Main CLI entry point for dogood."""
 
 import asyncio
 import json
+import os
 import sys
+from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
 
 app = typer.Typer(
     name="dogood",
-    help="Do-Good GitHub Agent: Find and fix bugs on social-good open-source projects",
+    help="dogood: Autonomous AI agent that finds and fixes bugs across open source",
 )
 console = Console(force_terminal=False)
 
@@ -98,7 +100,7 @@ def rank(
         console.print("[yellow]No repos in database. Run 'scan' first.[/yellow]")
         return
 
-    table = Table(title=f"Top {min(top, len(repos))} Do-Good Repositories")
+    table = Table(title=f"Top {min(top, len(repos))} dogood Repositories")
     table.add_column("Rank", style="dim", width=4)
     table.add_column("Repository", style="bold", max_width=40)
     table.add_column("Stars", justify="right", width=7)
@@ -177,6 +179,7 @@ def solve(
     dry_run: bool = typer.Option(False, help="Analyze only, don't create PR"),
     agent_id: str = typer.Option("", help="Agent ID (for factory mode)"),
     model_tier: str = typer.Option("", help="Model tier JSON (for factory mode)"),
+    is_bounty: bool = typer.Option(False, help="Bounty issue flag"),
 ):
     """Solve a specific issue using Claude and submit a PR."""
     from src.solver import Solver
@@ -190,13 +193,53 @@ def solve(
     solver = Solver(
         agent_id=agent_id or "main",
         model_tier=tier_dict,
+        is_bounty=is_bounty,
     )
     result = asyncio.run(solver.solve_issue(issue_id))
 
     if result["success"]:
         console.print(f"[green bold]PR created: {result['pr_url']}[/green bold]")
     else:
-        console.print(f"[red]Failed: {result.get('error', 'Unknown error')}[/red]")
+        error = result.get("error") or "Unknown error"
+        # Distinguish skips from real failures (exit code 2 = skipped)
+        is_skip = any(kw in error.lower() for kw in [
+            "unsupported language", "duplicate pr", "anti-ai", "requires cla",
+        ])
+        if is_skip:
+            console.print(f"[yellow]Skipped: {error}[/yellow]")
+            raise typer.Exit(code=2)
+        else:
+            console.print(f"[red]Failed: {error}[/red]")
+            raise typer.Exit(code=1)
+
+
+@app.command(name="solve-feedback")
+def solve_feedback(
+    contribution_id: int = typer.Option(..., help="Contribution ID with feedback to address"),
+    agent_id: str = typer.Option("", help="Agent ID (for factory mode)"),
+    model_tier: str = typer.Option("", help="Model tier JSON (for factory mode)"),
+):
+    """Address reviewer feedback on an existing PR."""
+    from src.solver import Solver
+
+    tier_dict = None
+    if model_tier:
+        tier_dict = json.loads(model_tier)
+
+    console.print(f"[blue]Addressing feedback on contribution {contribution_id}...[/blue]")
+    solver = Solver(
+        agent_id=agent_id or "feedback",
+        model_tier=tier_dict,
+    )
+    result = asyncio.run(solver.solve_feedback(contribution_id))
+
+    if result["success"]:
+        console.print(f"[green bold]Feedback addressed: {result['pr_url']}[/green bold]")
+    else:
+        error = result.get("error") or "Unknown error"
+        console.print(f"[red]Failed: {error}[/red]")
+        raise typer.Exit(code=1)
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -211,7 +254,7 @@ def run(
     from src.solver import Solver
     from src.db import get_connection
 
-    console.print("[bold]Starting Do-Good Agent pipeline...[/bold]\n")
+    console.print("[bold]Starting dogood pipeline...[/bold]\n")
 
     if not skip_scan:
         # Step 1: Scan
@@ -442,7 +485,7 @@ def stats():
         GROUP BY language ORDER BY c DESC LIMIT 5
     """).fetchall()
 
-    console.print("\n[bold]Do-Good Agent Statistics[/bold]\n")
+    console.print("\n[bold]dogood Statistics[/bold]\n")
     console.print(f"  Repositories tracked:  [cyan]{repo_count}[/cyan]")
     console.print(f"  Issues tracked:        [cyan]{issue_count}[/cyan]")
     console.print(f"  Open issues:           [cyan]{open_issues}[/cyan]")
@@ -503,7 +546,29 @@ def factory(
     max_cost_usd: float = typer.Option(0.0, help="Max total cost in USD (0=unlimited)"),
 ):
     """Run the multi-agent factory: spawns parallel agents to solve issues."""
+    import signal
     from src.orchestrator import AgentFactory
+
+    # PID file lock — prevent duplicate factories
+    pid_file = Path("/tmp/dogood-factory.pid")
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            # Check if process is still running
+            os.kill(old_pid, 0)
+            console.print(f"[red]Factory already running (PID {old_pid}). Exiting.[/red]")
+            raise typer.Exit(0)
+        except (ProcessLookupError, ValueError):
+            pass  # Old process is dead, take over
+
+    pid_file.write_text(str(os.getpid()))
+
+    def _cleanup_pid(*args):
+        pid_file.unlink(missing_ok=True)
+
+    signal.signal(signal.SIGTERM, lambda *a: (_cleanup_pid(), exit(0)))
+    import atexit
+    atexit.register(_cleanup_pid)
 
     console.print(f"[bold]Starting Agent Factory[/bold]")
     console.print(f"  Max issues:     {max_issues}")
@@ -638,9 +703,10 @@ def blacklist(
 
 @app.command()
 def bountywatch(
-    interval: int = typer.Option(120, help="Poll interval in seconds"),
+    interval: int = typer.Option(90, help="Poll interval in seconds"),
+    window: int = typer.Option(30, help="Freshness window in minutes"),
 ):
-    """Background daemon: scan GitHub for bounty issues every 2 min, solve with opus."""
+    """Background daemon: scan GitHub for bounty issues, analyze competing PRs, solve with best model."""
     import time
     import subprocess as sp
     from datetime import datetime, timezone, timedelta
@@ -651,14 +717,17 @@ def bountywatch(
     lang_list = ["Python", "JavaScript", "TypeScript", "Shell", "YAML", "HTML", "CSS", "Vue", "Svelte", "Lua"]
     seen_urls = set()
 
-    console.print(f"[bold]Bounty Watch started[/bold] — polling every {interval}s")
-    console.print(f"  Freshness window: 10 minutes")
+    console.print(f"[bold]Bounty Agent started[/bold] — polling every {interval}s")
+    console.print(f"  Freshness window: {window} minutes")
+    console.print(f"  Competitive analysis: enabled")
+    console.print(f"  Max competitor depth: 50 (skip if deeper)")
+    console.print(f"  Solver: quality-focused, 50 max turns")
     console.print(f"  Languages: {', '.join(lang_list)}")
     console.print()
 
     while True:
         try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
             bounty_labels = ["bounty", "has-bounty", "bounty-posted", "💰"]
             found = []
 
@@ -672,7 +741,7 @@ def bountywatch(
                          "-f", "sort=created",
                          "-f", "order=desc",
                          "-f", "per_page=10",
-                         "--jq", '.items[] | {url: .html_url, title: .title, number: .number, repo: .repository_url, labels: [.labels[].name], created: .created_at}'],
+                         "--jq", '.items[] | {url: .html_url, title: .title, number: .number, repo: .repository_url, labels: [.labels[].name], created: .created_at, body: .body}'],
                         capture_output=True, text=True, timeout=15
                     )
                     if r.returncode == 0 and r.stdout.strip():
@@ -693,100 +762,106 @@ def bountywatch(
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Found {len(found)} new bounties!", flush=True)
                 for item in found:
                     print(f"  💰 {item['url']} — {item['title'][:60]}", flush=True)
-                    # Notify Daniel via Telegram
-                    repo_name = item["repo"].replace("https://api.github.com/repos/", "")
+
+                    # Extract owner/repo
+                    repo_parts = item["repo"].replace("https://api.github.com/repos/", "").split("/")
+                    if len(repo_parts) != 2:
+                        continue
+                    owner, repo_name = repo_parts
+                    full_name = f"{owner}/{repo_name}"
+
+                    # Check blacklist
+                    bl = conn.execute(
+                        "SELECT 1 FROM repo_blacklist WHERE full_name = ? AND forgiven_at IS NULL",
+                        (full_name,)
+                    ).fetchone()
+                    if bl:
+                        print(f"    Skipped (blacklisted)", flush=True)
+                        continue
+
+                    # --- Competitive analysis: check existing PRs ---
+                    competing_prs = _fetch_competing_prs(full_name, item["number"])
+                    competitive_context = ""
+                    if competing_prs:
+                        print(f"    Found {len(competing_prs)} competing PR(s):", flush=True)
+                        max_depth = 0
+                        for cpr in competing_prs:
+                            print(f"      PR #{cpr['number']}: {cpr['title'][:50]} by @{cpr['author']} "
+                                  f"(depth: {cpr['depth']} = {cpr['commits']} commits + {cpr['comments']} comments)", flush=True)
+                            max_depth = max(max_depth, cpr["depth"])
+
+                        # Skip if competitors are 50+ iterations deep — too complex/contested
+                        if max_depth >= 50:
+                            print(f"    Skipped — competitor depth {max_depth} >= 50 (too deep)", flush=True)
+                            continue
+
+                        competitive_context = _build_competitive_context(full_name, competing_prs)
+                        print(f"    Competitive analysis ready ({len(competitive_context)} chars)", flush=True)
+                    else:
+                        print(f"    No competing PRs — we're first!", flush=True)
+
+                    # Notify Daniel
+                    comp_note = f"\n{len(competing_prs)} competing PRs" if competing_prs else "\nNo competition yet"
                     notify_github_attention(
-                        "bounty_found", repo_name, item["url"],
-                        f"#{item['number']}: {item['title'][:100]}\nLabels: {', '.join(item.get('labels', []))}"
+                        "bounty_found", full_name, item["url"],
+                        f"#{item['number']}: {item['title'][:100]}\nLabels: {', '.join(item.get('labels', []))}{comp_note}"
                     )
 
-                    # Extract owner/repo from repository_url
-                    repo_parts = item["repo"].replace("https://api.github.com/repos/", "").split("/")
-                    if len(repo_parts) == 2:
-                        owner, repo_name = repo_parts
-                        full_name = f"{owner}/{repo_name}"
+                    # Upsert repo and issue into DB
+                    _upsert_bounty_repo_issue(conn, full_name, item, sp)
 
-                        # Check blacklist
-                        bl = conn.execute(
-                            "SELECT 1 FROM repo_blacklist WHERE full_name = ? AND forgiven_at IS NULL",
-                            (full_name,)
-                        ).fetchone()
-                        if bl:
-                            print(f"    Skipped (blacklisted)", flush=True)
-                            continue
+                    # Get issue_id and repo info for model selection
+                    repo_row = conn.execute(
+                        "SELECT id, language, stars FROM repositories WHERE full_name = ?", (full_name,)
+                    ).fetchone()
+                    if not repo_row:
+                        print(f"    Skipped (repo not in DB)", flush=True)
+                        continue
+                    issue_row = conn.execute(
+                        "SELECT id FROM issues WHERE repo_id = ? AND number = ?",
+                        (repo_row["id"], item["number"])
+                    ).fetchone()
+                    if not issue_row:
+                        print(f"    Skipped (issue not in DB)", flush=True)
+                        continue
 
-                        # Upsert repo and issue into DB, then solve immediately
-                        from src.scanner import Scanner
-                        scanner = Scanner()
+                    # Select model tier based on complexity (same as factory)
+                    from src.model_selector import score_complexity, select_tier
+                    from src.solver import Solver
+                    repo_dict = {"language": repo_row["language"], "stars": repo_row["stars"], "open_issues": 0}
+                    issue_dict = {
+                        "title": item.get("title", ""),
+                        "body": item.get("body", ""),
+                        "labels": json.dumps(item.get("labels", [])),
+                        "comments_count": 0,
+                    }
+                    complexity = score_complexity(issue_dict, repo_dict)
+                    model_tier = select_tier(complexity, issue_row["id"], conn)
+                    print(f"    Bounty Agent: complexity {complexity:.3f} → {model_tier['label']} (50 turns)", flush=True)
 
-                        # Quick repo upsert
-                        repo_data = sp.run(
-                            ["gh", "api", f"repos/{full_name}",
-                             "--jq", '{github_id: .id, owner: .owner.login, name: .name, full_name: .full_name, url: .html_url, stars: .stargazers_count, forks: .forks_count, open_issues: .open_issues_count, description: .description, language: .language, license: .license.spdx_id}'],
-                            capture_output=True, text=True, timeout=15
+                    solver = Solver(model_tier=model_tier, is_bounty=True)
+
+                    # Inject competitive context into the issue body so the solver sees it
+                    if competitive_context:
+                        conn.execute(
+                            "UPDATE issues SET body = COALESCE(body, '') || ? WHERE id = ?",
+                            (f"\n\n---\n## Competitive Analysis (existing PRs)\n{competitive_context}", issue_row["id"])
                         )
-                        if repo_data.returncode == 0 and repo_data.stdout.strip():
-                            import json as _json
-                            rd = _json.loads(repo_data.stdout)
-                            rd["topics"] = "[]"
-                            rd["pushed_at"] = None
-                            from src.db import upsert_repository
-                            upsert_repository(conn, rd)
+                        conn.commit()
 
-                        # Get repo_id
-                        repo_row = conn.execute(
-                            "SELECT id FROM repositories WHERE full_name = ?", (full_name,)
-                        ).fetchone()
-                        if not repo_row:
-                            print(f"    Skipped (repo not in DB)", flush=True)
-                            continue
-
-                        # Upsert issue
-                        from src.db import upsert_issue
-                        issue_data = {
-                            "github_id": item["number"] * 1000000 + repo_row["id"],
-                            "repo_id": repo_row["id"],
-                            "number": item["number"],
-                            "title": item["title"],
-                            "body": "",
-                            "state": "open",
-                            "labels": _json.dumps(item.get("labels", [])),
-                            "comments_count": 0,
-                            "is_assigned": 0,
-                            "is_pull_request": 0,
-                            "created_at": item.get("created"),
-                            "updated_at": item.get("created"),
-                        }
-                        upsert_issue(conn, issue_data)
-
-                        # Get issue_id
-                        issue_row = conn.execute(
-                            "SELECT id FROM issues WHERE repo_id = ? AND number = ?",
-                            (repo_row["id"], item["number"])
-                        ).fetchone()
-                        if not issue_row:
-                            print(f"    Skipped (issue not in DB)", flush=True)
-                            continue
-
-                        # Solve with opus immediately
-                        print(f"    Solving with opus...", flush=True)
-                        from src.solver import Solver
-                        from src.config import MODEL_TIERS
-                        opus_tier = MODEL_TIERS[-1]  # tier 4 = opus
-                        solver = Solver(model_tier=opus_tier)
-                        try:
-                            import asyncio
-                            result = asyncio.run(solver.solve_issue(issue_row["id"]))
-                            if result["success"]:
-                                print(f"    ✅ PR created: {result['pr_url']}", flush=True)
-                                notify_github_attention(
-                                    "pr_merged", full_name, result["pr_url"],
-                                    f"Bounty PR submitted for #{item['number']}: {item['title'][:80]}"
-                                )
-                            else:
-                                print(f"    ❌ Failed: {result.get('error', '')[:80]}", flush=True)
-                        except Exception as e:
-                            print(f"    ❌ Error: {e}", flush=True)
+                    try:
+                        import asyncio
+                        result = asyncio.run(solver.solve_issue(issue_row["id"]))
+                        if result["success"]:
+                            print(f"    PR created: {result['pr_url']}", flush=True)
+                            notify_github_attention(
+                                "pr_merged", full_name, result["pr_url"],
+                                f"Bounty PR submitted for #{item['number']}: {item['title'][:80]}"
+                            )
+                        else:
+                            print(f"    Failed: {result.get('error', '')[:80]}", flush=True)
+                    except Exception as e:
+                        print(f"    Error: {e}", flush=True)
             else:
                 ts = datetime.now().strftime('%H:%M:%S')
                 print(f"[{ts}] No new bounties", flush=True)
@@ -795,6 +870,125 @@ def bountywatch(
             print(f"Bounty watch error: {e}", flush=True)
 
         time.sleep(interval)
+
+
+def _fetch_competing_prs(full_name: str, issue_number: int) -> list:
+    """Fetch open PRs that reference this issue number, including depth signals."""
+    import subprocess as sp
+    try:
+        r = sp.run(
+            ["gh", "pr", "list", "--repo", full_name,
+             "--state", "open", "--search", str(issue_number),
+             "--json", "number,title,url,author,additions,deletions,changedFiles,commits,reviewDecision,comments",
+             "--limit", "5"],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            prs = json.loads(r.stdout)
+            # Filter to PRs that actually reference the issue
+            issue_str = f"#{issue_number}"
+            relevant = []
+            for pr in prs:
+                title = (pr.get("title") or "").lower()
+                if (issue_str in title or str(issue_number) in title
+                        or f"fix {issue_str}" in title or f"fixes {issue_str}" in title
+                        or f"close {issue_str}" in title or f"closes {issue_str}" in title):
+                    # Estimate competitor depth: commits + review comments as proxy for iterations
+                    commits = len(pr.get("commits", []))
+                    comments = len(pr.get("comments", []))
+                    depth = commits + comments
+                    relevant.append({
+                        "number": pr["number"],
+                        "title": pr["title"],
+                        "url": pr["url"],
+                        "author": pr.get("author", {}).get("login", "?"),
+                        "additions": pr.get("additions", 0),
+                        "deletions": pr.get("deletions", 0),
+                        "changed_files": pr.get("changedFiles", 0),
+                        "commits": commits,
+                        "comments": comments,
+                        "depth": depth,
+                    })
+            return relevant
+    except Exception:
+        pass
+    return []
+
+
+def _build_competitive_context(full_name: str, competing_prs: list) -> str:
+    """Fetch diffs of competing PRs and build a context summary for opus."""
+    import subprocess as sp
+    parts = []
+    for pr in competing_prs[:3]:  # Max 3 competing PRs to keep context manageable
+        parts.append(f"### PR #{pr['number']} by @{pr['author']}: {pr['title']}")
+        parts.append(f"Files changed: {pr['changed_files']}, +{pr['additions']}/-{pr['deletions']}")
+        # Fetch the diff
+        try:
+            r = sp.run(
+                ["gh", "pr", "diff", str(pr["number"]), "--repo", full_name],
+                capture_output=True, text=True, timeout=20
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                diff = r.stdout.strip()
+                # Truncate large diffs
+                if len(diff) > 3000:
+                    diff = diff[:3000] + "\n... (diff truncated)"
+                parts.append(f"```diff\n{diff}\n```")
+        except Exception:
+            parts.append("(diff unavailable)")
+        parts.append("")
+
+    context = "\n".join(parts)
+    context += "\n**Goal:** Create a BETTER fix than the above. Look for:\n"
+    context += "- Edge cases they missed\n"
+    context += "- Better error handling\n"
+    context += "- More complete test coverage\n"
+    context += "- Cleaner implementation\n"
+    context += "- Issues with their approach\n"
+    return context
+
+
+def _upsert_bounty_repo_issue(conn, full_name: str, item: dict, sp):
+    """Quick upsert of repo and issue for bounty processing."""
+    import json as _json
+
+    # Quick repo upsert
+    repo_data = sp.run(
+        ["gh", "api", f"repos/{full_name}",
+         "--jq", '{github_id: .id, owner: .owner.login, name: .name, full_name: .full_name, url: .html_url, stars: .stargazers_count, forks: .forks_count, open_issues: .open_issues_count, description: .description, language: .language, license: .license.spdx_id}'],
+        capture_output=True, text=True, timeout=15
+    )
+    if repo_data.returncode == 0 and repo_data.stdout.strip():
+        rd = _json.loads(repo_data.stdout)
+        rd["topics"] = "[]"
+        rd["pushed_at"] = None
+        from src.db import upsert_repository
+        upsert_repository(conn, rd)
+
+    # Get repo_id
+    repo_row = conn.execute(
+        "SELECT id FROM repositories WHERE full_name = ?", (full_name,)
+    ).fetchone()
+    if not repo_row:
+        return
+
+    # Upsert issue
+    from src.db import upsert_issue
+    issue_data = {
+        "github_id": item["number"] * 1000000 + repo_row["id"],
+        "repo_id": repo_row["id"],
+        "number": item["number"],
+        "title": item["title"],
+        "body": item.get("body", "") or "",
+        "state": "open",
+        "labels": _json.dumps(item.get("labels", [])),
+        "comments_count": 0,
+        "is_assigned": 0,
+        "is_pull_request": 0,
+        "created_at": item.get("created"),
+        "updated_at": item.get("created"),
+    }
+    upsert_issue(conn, issue_data)
 
 
 @app.command()
@@ -806,9 +1000,10 @@ def clascan(
     import base64
     import subprocess as sp
     from src.db import get_connection, add_to_blacklist
+    import re
     from src.config import (
-        CLA_ORGS, SIGNED_CLA_ORGS, CLA_KEYWORDS, ANTI_AI_KEYWORDS,
-        SUPPORTED_LANGUAGES,
+        CLA_ORGS, SIGNED_CLA_ORGS, CLA_KEYWORDS, CLA_CONTEXTUAL_PATTERNS,
+        ANTI_AI_KEYWORDS, SUPPORTED_LANGUAGES,
     )
 
     conn = get_connection()
@@ -860,13 +1055,22 @@ def clascan(
             if r.returncode == 0 and r.stdout.strip():
                 text = base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace").lower()
 
-                # Check CLA
+                # Check CLA enforcement phrases + contextual patterns
+                cla_hit = False
                 for kw in CLA_KEYWORDS:
                     if kw in text:
                         add_to_blacklist(conn, fn, "cla_required",
                                          details=f'{{"source":"contributing_scan","keyword":"{kw}"}}')
                         cla_found += 1
+                        cla_hit = True
                         break
+                if not cla_hit:
+                    for pattern in CLA_CONTEXTUAL_PATTERNS:
+                        if re.search(pattern, text):
+                            add_to_blacklist(conn, fn, "cla_required",
+                                             details=f'{{"source":"contributing_scan","pattern":"{pattern[:60]}"}}')
+                            cla_found += 1
+                            break
 
                 # Check anti-AI
                 for kw in ANTI_AI_KEYWORDS:
